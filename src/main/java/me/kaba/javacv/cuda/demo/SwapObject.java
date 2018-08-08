@@ -22,7 +22,7 @@ import org.bytedeco.javacpp.Pointer;
  */
 public abstract class SwapObject<T> extends Pointer
 {
-    private static final boolean DEBUG=false;
+    private static final boolean DEBUG=true;
     private static Path swapdir=null;
     static {
         try {
@@ -47,7 +47,8 @@ public abstract class SwapObject<T> extends Pointer
         }
     }
     private final static Queue<WeakReference<? extends SwapObject>> queue = new ArrayDeque<>();  // FIXME: ok without <T> ???????
-    private static long usedMem=0L;
+    private final static long maxPhys = Pointer.maxPhysicalBytes() * 94L / 100L;
+    private static long usedPhys=0L;
     private Path swapfile=null;
     private boolean swapedOut=false, locked=false, released=false;
     private long size=-1L;
@@ -56,7 +57,7 @@ public abstract class SwapObject<T> extends Pointer
     /** only use in exceptional cases when payload already exists */
     protected SwapObject( long s ) {
         this.size = s;
-        usedMem += this.size;
+        usedPhys += this.size;
     }
 
     /** never use; only to satisfy default constructor requirement */
@@ -76,18 +77,18 @@ public abstract class SwapObject<T> extends Pointer
 
     private void occupyMemWithFree( long required, LongSupplier activity ) {
         OutOfMemoryError lastOOME=null;
-        final long max_phy = Pointer.maxPhysicalBytes();
-        if( required > max_phy )
-            throw new IllegalArgumentException("cannot allocate "+required+" bytes in native mem, as maximum is "+max_phy);
-        long free_phy = max_phy - Pointer.physicalBytes();
+        if( required > maxPhys )
+            throw new IllegalArgumentException("cannot allocate "+required+" bytes in native mem, as maximum is "+maxPhys);
+//        long free_phy = maxPhys - Pointer.physicalBytes();
         retries_alloc:
         do {
             for( int i=0; i<RETRIES; i++ ) {
+                long free_phy = maxPhys - usedPhys;
                 try {
                 if( required > free_phy )
                     freePhysical( required-free_phy );
                 size = activity.getAsLong();
-                usedMem += this.size;
+                usedPhys += this.size;
 //                queue.add( new WeakReference<>(this) );
                 //<editor-fold defaultstate="collapsed" desc="debug output on">
                 if(true&&DEBUG)
@@ -112,8 +113,11 @@ public abstract class SwapObject<T> extends Pointer
                 liberation:
                 while( (to_free<amount) && (!queue.isEmpty()) ) {
                     final WeakReference<? extends SwapObject> ref = queue.poll();
+                    assert( ref != null );
                     final SwapObject<T> so = ref.get();
                     if( so==null )
+                        continue liberation;  // drop polled ref, 'cause it doesn't reference nothin anymore
+                    if( so.released )
                         continue liberation;  // drop polled ref, 'cause it doesn't reference nothin anymore
 //                    synchronized(so) { // ATTENTION: possible source of deadlock if somewhere so and queue were synchronized other way around !!!
 //                        if( so.released==true )
@@ -121,23 +125,31 @@ public abstract class SwapObject<T> extends Pointer
 //                        tmpq.add( ref );  // remember to re-add later
 //                        freed += so.swapOut();
 //                    }
-                    swap_q.add( ref );
+                    swap_q.add( ref );  // remember for swapping below
                     to_free += so.size;
                 }
             } finally {
                 queue.addAll( tmpq );  // re-add swapped out objects
             }
         }
-        tmpq.clear();
+        //<editor-fold defaultstate="collapsed" desc="debug output on">
+        if(true&&DEBUG)
+                System.out.println( toString()+" goin2 free "+to_free+" bytes of memory by swapping "+swap_q.size() );
+        //</editor-fold>
         try {
             liberation2:
             while( ! swap_q.isEmpty() ) {
                 final WeakReference<? extends SwapObject> ref = swap_q.poll();
+                assert( ref != null );
                 final SwapObject<T> so = ref.get();
+                //<editor-fold defaultstate="collapsed" desc="debug output on">
+                if(true&&DEBUG)
+                        System.out.println( toString()+" got from swap_q: "+ref+" - "+so );
+                //</editor-fold>
                 if( so==null )
-                    continue liberation2;
+                    continue liberation2;  // silently drop ref, because nothing referenced anymore; FIXME: but still was referenced above!?
                 synchronized(so) {
-                    if( so.released==true )
+                    if( so.released )
                         continue liberation2;  // drop polled ref, 'cause it doesn't reference nothin anymore
                     tmpq.add( ref );  // remember to re-add later
                     freed += so.swapOut();
@@ -167,21 +179,32 @@ public abstract class SwapObject<T> extends Pointer
 
     private long swapOut() {
         assert( ! released );
-        if( locked )
+        if( locked ) {
+            //<editor-fold defaultstate="collapsed" desc="debug output on">
+            if(true&&DEBUG)
+                    System.out.println( toString()+" locked" );
+            //</editor-fold>
             return 0L; // do not swap out when locked
+        }
         synchronized(this) {
             try {
-                if( swapedOut )
+                if( swapedOut ) {
+                    //<editor-fold defaultstate="collapsed" desc="debug output on">
+                    if(true&&DEBUG)
+                            System.out.println( toString()+" already swapped out" );
+                    //</editor-fold>
                     return 0L;
+                }
                 if( swapfile == null )
                     swapfile = Files.createTempFile( swapdir, "", getTmpExt_basic() );
                 swapOutPayload_basic( swapfile );
                 swapedOut = true;
-                usedMem -= size;
+                usedPhys -= size;
                 //<editor-fold defaultstate="collapsed" desc="debug output on">
                 if(true&&DEBUG)
-                        System.out.println( toString()+" swapped out to "+swapfile.toString() );
+                        System.out.println( toString()+" swapped out "+size+" bytes to "+swapfile.toString() );
                 //</editor-fold>
+                return size;
             } catch( IOException e ) {
                 System.err.println("cannot swap out: "+e);
                 e.printStackTrace(System.err);
@@ -193,7 +216,7 @@ public abstract class SwapObject<T> extends Pointer
                 throw(t);
             }
         }
-        return size;
+        return 0L;  // somethin went wrong
     }
 
     protected abstract String getTmpExt_basic();
@@ -203,11 +226,11 @@ public abstract class SwapObject<T> extends Pointer
     private void swapIn() {
         assert( ! released );
         try {
-            occupyMemWithFree( size, () -> {
+            occupyMemWithFree(size, () -> {
                 try {
                     swapInPayload_basic( swapfile );
                     swapedOut = false;
-                    usedMem += size;
+                    usedPhys += size;
                     //<editor-fold defaultstate="collapsed" desc="debug output on">
                     if(true&&DEBUG)
                             System.out.println( toString()+" swapped in from "+swapfile.toString() );
@@ -248,12 +271,14 @@ public abstract class SwapObject<T> extends Pointer
             synchronized(this) {
                 if( ! swapedOut )
                     basic_ret = releasePayload_basic();
-                released = true;
-                usedMem -= size;
-                if( swapfile != null ) {
-                    del_ret = swapfile.toFile().delete();
-                    if( del_ret )
-                        swapfile = null;
+                if( basic_ret ) {
+                    released = true;
+                    usedPhys -= size;
+                    if( swapfile != null ) {
+                        del_ret = swapfile.toFile().delete();
+                        if( del_ret )
+                            swapfile = null;
+                    }
                 }
             }
             //<editor-fold defaultstate="collapsed" desc="debug output on">
@@ -261,6 +286,8 @@ public abstract class SwapObject<T> extends Pointer
                     System.out.println( toString()+(basic_ret?"":" not")+" released "+size+" bytes of memory, "+(del_ret?"":"not ")+"deleted "+swapfile );
             //</editor-fold>
             return basic_ret && del_ret;
+        } catch(Throwable t) {
+            System.out.println( "cannot release payload: "+t );
         } finally {
             return false; // somethin went wrong
         }
@@ -283,11 +310,15 @@ public abstract class SwapObject<T> extends Pointer
     protected class DecDeallocator implements Pointer.Deallocator {
         @Override
         public void deallocate() {
-            usedMem -= size;
+            usedPhys -= size;
         }
     }
 
-    public static long getUsedMem() { return usedMem; }
+    public static long getUsedMem() { return usedPhys; }
+
+    public String toString( String subclass_spec ) {
+        return "[ "+subclass_spec+", "+size+" "+(swapedOut?"S":"s")+(locked?"L":"l")+(released?"R":"r")+" "+(swapfile==null?"null":swapfile.toString())+"]";
+    }
 
     /** ONLY FOR ACCESS BY TEST CLASSES! */
     protected long test_swapOut() {

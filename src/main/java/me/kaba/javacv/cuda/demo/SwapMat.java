@@ -118,25 +118,67 @@ public class SwapMat // FIXME: think about implementing Mat methods on SwapMat w
 
     @Override
     protected long allocatePayload_basic( ParamVariant v ) {
-        if( v.getVariant() == MatParamVariant.SIZE_T.i)
+        //<editor-fold defaultstate="collapsed" desc="debug output prep">
+        long paramsize=-1L;
+        //</editor-fold>
+        if( v.getVariant() == MatParamVariant.SIZE_T.i) {
             allocatePayload( paramS, paramT );
-        else if( v.getVariant() == MatParamVariant.R_C_T.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramS,paramT);
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.R_C_T.i) {
             allocatePayload( paramR, paramC, paramT );
-        else if( v.getVariant() == MatParamVariant.ZERO_SIZE_T.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramR,paramC,paramT);
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.ZERO_SIZE_T.i) {
             allocatePayloadZ( paramS, paramT );
-        else if( v.getVariant() == MatParamVariant.ZERO_R_C_T.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramS,paramT);
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.ZERO_R_C_T.i) {
             allocatePayloadZ( paramR, paramC, paramT );
-        else if( v.getVariant() == MatParamVariant.ONE_SIZE_T.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramR,paramC,paramT);
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.ONE_SIZE_T.i) {
             allocatePayloadO( paramS, paramT );
-        else if( v.getVariant() == MatParamVariant.ONE_R_C_T.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramS,paramT);
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.ONE_R_C_T.i) {
             allocatePayloadO( paramR, paramC, paramT );
-        else if( v.getVariant() == MatParamVariant.SM_R.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramR,paramC,paramT);
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.SM_R.i) {
             allocatePayload( paramSM, paramRect );
-        else if( v.getVariant() == MatParamVariant.EMPTY.i)
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = CV_MAT_MEM_SIZE(paramRect.height(),paramRect.width(),paramSM.getPayload().type());
+            //</editor-fold>
+        } else if( v.getVariant() == MatParamVariant.EMPTY.i) {
             allocatePayload();
-        else
+            //<editor-fold defaultstate="collapsed" desc="debug prep off">
+            if(false)
+                paramsize = 0L;
+            //</editor-fold>
+        } else
             throw new IllegalStateException("don't know ParamVariant "+v.getVariant()+" in SwapMat");
-        return CV_MAT_MEM_SIZE( this.mat );
+        //<editor-fold defaultstate="collapsed" desc="debug output off">
+        if(false)
+            System.out.println( "paramsize:"+paramsize+"mysize:"+CV_MAT_MEM_SIZE(this.mat)+", sizeof:"+this.mat.sizeof()+", buffersize:"+this.mat.arraySize()+", total:"+this.mat.total()
+                                +" - cn:"+opencv_core.CV_MAT_CN(this.mat.type())+", d:"+CV_MAT_DEPTH_BYTES(this.mat.type())+", s:"+this.mat.step(0) );
+
+        //</editor-fold>
+//        return CV_MAT_MEM_SIZE( this.mat );
+        return this.mat.arraySize();
     }
 
     @Override
@@ -185,6 +227,11 @@ public class SwapMat // FIXME: think about implementing Mat methods on SwapMat w
         }
     }
 
+    @Override
+    public String toString() {
+        return super.toString( "[SwapMat: "+(mat==null?"null":mat.toString())+"]" );
+    }
+
     private enum MatParamVariant
         implements ParamVariant {
         SIZE_T(1), R_C_T(2), ZERO_SIZE_T(3), ZERO_R_C_T(4), ONE_SIZE_T(5), ONE_R_C_T(6), SM_R(7), EMPTY(8);
@@ -206,7 +253,8 @@ public class SwapMat // FIXME: think about implementing Mat methods on SwapMat w
 
 
     public static long CV_MAT_MEM_SIZE( Mat m ) {
-        return CV_MAT_MEM_SIZE( m.step( 0 ), m.rows(), m.type() );
+//        return CV_MAT_MEM_SIZE( m.step( 0 ), m.rows(), m.type() );
+        return (long)m.rows() * (long)m.step( 0 );
     }
 
     public static long CV_MAT_MEM_SIZE( Size s, int t ) {
@@ -214,13 +262,13 @@ public class SwapMat // FIXME: think about implementing Mat methods on SwapMat w
     }
 
     public static long CV_MAT_MEM_SIZE( int r, int c, int t ) {
-        return r*c*opencv_core.CV_MAT_CN( t )*CV_MAT_DEPTH_BYTES( t );
+        return (long)r * (long)c * (long)opencv_core.CV_MAT_CN(t) * (long)CV_MAT_DEPTH_BYTES(t);
     }
 
     private static final int[] CVMAT_DEPTH_BYTES = new int[opencv_core.CV_DEPTH_MAX];
     static {
         for( int d=0; d<opencv_core.CV_DEPTH_MAX; d++ ) {
-            CVMAT_DEPTH_BYTES[d] = 2 ^ (d>>1);
+            CVMAT_DEPTH_BYTES[d] = (int) Math.pow( 2, (d>>>1) );
         }
     }
 
