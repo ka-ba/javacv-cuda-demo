@@ -5,9 +5,8 @@ package me.kaba.javacv.cuda.demo;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Queue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.bytedeco.javacpp.Pointer;
 import org.bytedeco.javacpp.opencv_core;
@@ -23,9 +22,12 @@ import org.bytedeco.javacpp.opencv_core.Size;
 public class Pinned
 {
     private static final int MAX_MATS=700;
+    private static final int INFO_MOD=100;
     private static final Size matSize = new Size( 4000, 6000 );
 //    private List<Mat> mats = new ArrayList<>();
     private Queue<SwapMat> mats = new ArrayDeque<>();
+    private volatile int c;
+    private AtomicInteger a = new AtomicInteger();
 
     public static void main(String[] args) throws IOException {
         new Pinned().go();
@@ -39,12 +41,12 @@ public class Pinned
         Mat.setDefaultAllocator( allocator );
 
         try {
-            IntStream.range( 0, MAX_MATS)./*parallel().*/forEach( i -> {
+            IntStream.range( 0, MAX_MATS).parallel().forEach( i -> {
                 SwapMat sm=null;
 //            for( int i=0; i<MAX_MATS; i++ ) {
 //                mats.add( new Mat(matSize) );
 //                mats.add( Mat.ones(matSize,opencv_core.CV_8UC1).asMat() );
-                if( i%3 == 2 ) {
+                if( i%4 == 2 ) {
                     synchronized(mats) {
                         sm = mats.poll();
                     }
@@ -55,8 +57,10 @@ public class Pinned
                 synchronized(mats) {
                     mats.add( sm );
                 }
-                if( i%100 == 0)
-                    System.out.printf( "- %5d ... used %10d of %10d (%3d%%)\n                 %10d\n",mats.size(),Pointer.physicalBytes(),Pointer.maxPhysicalBytes(),(Pointer.physicalBytes()*100/Pointer.maxPhysicalBytes()),SwapMat.getUsedMem() );
+                if( i%INFO_MOD == 0)
+                    System.out.printf( "- %5d ... used %11d of %11d (%3d%%)\n                 %11d of %11d\n",
+                                       mats.size(),Pointer.physicalBytes(),Pointer.maxPhysicalBytes(),(Pointer.physicalBytes()*100/Pointer.maxPhysicalBytes()),
+                                       SwapMat.getUsedMem(),SwapMat.getMaxMem(),(SwapMat.getUsedMem()*100/SwapMat.getMaxMem()) );
 //                    System.out.println( "- "+mats.size()+"... used "+Pointer.physicalBytes()+" of "+Pointer.maxPhysicalBytes() );
             } );
 //            System.out.print( " 8UC1 - " ); mats.add( SwapMat.ones(matSize,opencv_core.CV_8UC1) );
@@ -71,15 +75,28 @@ public class Pinned
             t.printStackTrace(System.out);
         }
 
-        System.out.println("allocated "+mats.size()+" Mats - in pinned mem? - getting&releasing");
+        System.out.println("allocated "+mats.size()+" Mats - in pinned mem? - getting");
 
 //        for( Mat m: mats )
 //            m.release();
+        c = 0;
         mats.parallelStream().forEach( (sm) -> {
             sm.getPayload(); // test multiple swap cycles
+            if( (c++)%INFO_MOD == 0)
+                System.out.printf( "- %5d ... used %11d of %11d (%3d%%)\n                 %11d of %11d (%3d%%)\n",
+                                   c,Pointer.physicalBytes(),Pointer.maxPhysicalBytes(),(Pointer.physicalBytes()*100/Pointer.maxPhysicalBytes()),
+                                   SwapMat.getUsedMem(),SwapMat.getMaxMem(),(SwapMat.getUsedMem()*100/SwapMat.getMaxMem()) );
         } );
+
+        System.out.println("got -> releasing");
+
+        a.set( 0 );
         mats.parallelStream().forEach( (sm) -> {
             sm.getPayload().release();
+            if( (a.incrementAndGet())%INFO_MOD == 0)
+                System.out.printf( "- %5d ... used %11d of %11d (%3d%%)\n                 %11d of %11d (%3d%%)\n",
+                                   a.get(),Pointer.physicalBytes(),Pointer.maxPhysicalBytes(),(Pointer.physicalBytes()*100/Pointer.maxPhysicalBytes()),
+                                   SwapMat.getUsedMem(),SwapMat.getMaxMem(),(SwapMat.getUsedMem()*100/SwapMat.getMaxMem()) );
         } );
 
         System.gc();

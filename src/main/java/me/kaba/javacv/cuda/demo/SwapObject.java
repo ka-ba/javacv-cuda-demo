@@ -23,10 +23,19 @@ import org.bytedeco.javacpp.Pointer;
 public abstract class SwapObject<T> extends Pointer
 {
     private static final boolean DEBUG=true;
+    //<editor-fold defaultstate="collapsed" desc="debug id">
+    private static final boolean IDDEBUG=(true&&DEBUG);
+    private static SafeContinousCounter debugIdCounter=null;  // debug
+    static {
+        if(IDDEBUG)
+            debugIdCounter = new SafeContinousCounter(1L);
+    }
+    private final long debugid;
+    //</editor-fold>
     private static Path swapdir=null;
     static {
         try {
-            swapdir = Files.createTempDirectory( "electric." );
+            swapdir = Files.createTempDirectory( "SwapObject." );
             Runtime.getRuntime().addShutdownHook( new Thread(){
                 @Override
                 public void run() {
@@ -47,35 +56,42 @@ public abstract class SwapObject<T> extends Pointer
         }
     }
     private final static Queue<WeakReference<? extends SwapObject>> queue = new ArrayDeque<>();  // FIXME: ok without <T> ???????
-    private final static long maxPhys = Pointer.maxPhysicalBytes() * 94L / 100L;
-    private static long usedPhys=0L;
-    private Path swapfile=null;
-    private boolean swapedOut=false, locked=false, released=false;
-    private long size=-1L;
+    private final static long maxMaxPhys = Pointer.maxPhysicalBytes() * 95L / 100L;
+    private final static long maxPhysStep = Pointer.maxPhysicalBytes() / 200L;  // .5% up-stepping
+    private volatile static long maxPhys/*=maxMaxPhys*/, usedPhys/*=0L*/;  // dynamic maxPhys
+    static {
+        maxPhys = maxMaxPhys;
+    }
+    private volatile Path swapfile/*=null*/;
+    private volatile boolean swapedOut/*=false*/, locked/*=false*/, released/*=false*/;
+    private volatile long size/*=-1L*/;  // really volatile??
     protected int RETRIES=20;
 
-    /** only use in exceptional cases when payload already exists */
-    protected SwapObject( long s ) {
-        this.size = s;
-        usedPhys += this.size;
+    protected SwapObject( ParamVariant p ) {
+        //<editor-fold defaultstate="collapsed" desc="debug id">
+        debugid = (IDDEBUG?debugIdCounter.getNext():Long.MAX_VALUE);
+        //</editor-fold>
+        size = -1L;
+        occupyMemWithFree( p.getRequired(), () -> {
+            final long actual_size = allocatePayload_basic( p );
+            return actual_size;
+        } );
+        synchronized(queue) {
+            queue.add( new WeakReference<>(this) );  // ATTENTION: <? extends this> not completely constructed yet (this is, though)
+        }
     }
 
     /** never use; only to satisfy default constructor requirement */
-    protected SwapObject() {
+    private SwapObject() {
+        //<editor-fold defaultstate="collapsed" desc="debug id">
+        debugid = (IDDEBUG?debugIdCounter.getNext():Long.MAX_VALUE);
+        //</editor-fold>
+        size = -1L;
     }
 
     protected abstract long allocatePayload_basic( ParamVariant v );
 
-    protected void allocatePayloadWithFree( ParamVariant v, long required/*, Queue<WeakReference<? extends SwapObject<T>>> queue*/ ) {
-        assert( ! released );
-        occupyMemWithFree( required, () -> {
-            final long ret = allocatePayload_basic( v );
-            queue.add( new WeakReference<>(this) );
-            return ret;
-        } );
-    }
-
-    private void occupyMemWithFree( long required, LongSupplier activity ) {
+    private void occupyMemWithFree( long required, LongSupplier allocator ) {
         OutOfMemoryError lastOOME=null;
         if( required > maxPhys )
             throw new IllegalArgumentException("cannot allocate "+required+" bytes in native mem, as maximum is "+maxPhys);
@@ -83,83 +99,88 @@ public abstract class SwapObject<T> extends Pointer
         retries_alloc:
         do {
             for( int i=0; i<RETRIES; i++ ) {
-                long free_phy = maxPhys - usedPhys;
+                final long free_phy = maxPhys - usedPhys;
                 try {
-                if( required > free_phy )
-                    freePhysical( required-free_phy );
-                size = activity.getAsLong();
-                usedPhys += this.size;
-//                queue.add( new WeakReference<>(this) );
-                //<editor-fold defaultstate="collapsed" desc="debug output on">
-                if(true&&DEBUG)
-                        System.out.println( toString()+" allocated "+size+" bytes of payload" );
-                //</editor-fold>
-                break retries_alloc;
+                    if( required > free_phy )
+                        freePhysical( required-free_phy );
+                    size = allocator.getAsLong();
+                    usedPhys += this.size;
+                    //<editor-fold defaultstate="collapsed" desc="debug output off">
+                    if(false&&DEBUG)
+                            System.out.println( toString()+" allocated "+size+" bytes of payload" );
+                    //</editor-fold>
+                    break retries_alloc;
                 } catch(OutOfMemoryError e) {
                     lastOOME = e;
-                    free_phy = 0L;  // trigger releasePayload of required from second try on
+                    if( ! (e instanceof UnableToReleaseError) ) {  // this means javacpp physical memory full
+                        maxPhys = usedPhys;  // reduce our idea of what we may use; gradually increased later on
+                        //<editor-fold defaultstate="collapsed" desc="debug output on">
+                        if(true&&DEBUG)
+                            System.out.printf( "%s physical memory exhausted - lowering maxPhys to own current usage\n  -  used %11d of %11d (%3d%%)\n          %11d of %11d\n",
+                                               toString(),Pointer.physicalBytes(),Pointer.maxPhysicalBytes(),(Pointer.physicalBytes()*100/Pointer.maxPhysicalBytes()),SwapMat.getUsedMem(),maxPhys );
+                        //</editor-fold>
+                    }
                 }
             }
             throw lastOOME;
         } while(false); // one pass only
     }
 
-    private void freePhysical( long amount ) {
+    private void freePhysical( long amount )
+            throws UnableToReleaseError {
         Queue<WeakReference<? extends SwapObject>> tmpq = new ArrayDeque<>(),  // FIXME: ... without <T> ... see above
                 swap_q = new ArrayDeque<>();
         long to_free=0L, freed=0L;
         synchronized(queue) {
             try {
-                liberation:
+                liberation1:
                 while( (to_free<amount) && (!queue.isEmpty()) ) {
-                    final WeakReference<? extends SwapObject> ref = queue.poll();
-                    assert( ref != null );
-                    final SwapObject<T> so = ref.get();
-                    if( so==null )
-                        continue liberation;  // drop polled ref, 'cause it doesn't reference nothin anymore
-                    if( so.released )
-                        continue liberation;  // drop polled ref, 'cause it doesn't reference nothin anymore
-//                    synchronized(so) { // ATTENTION: possible source of deadlock if somewhere so and queue were synchronized other way around !!!
-//                        if( so.released==true )
-//                            continue liberation;  // drop polled ref, 'cause it doesn't reference nothin anymore
-//                        tmpq.add( ref );  // remember to re-add later
-//                        freed += so.swapOut();
-//                    }
-                    swap_q.add( ref );  // remember for swapping below
-                    to_free += so.size;
+                    final WeakReference<? extends SwapObject> ref1 = queue.poll();
+                    assert( ref1 != null );
+                    final SwapObject<T> so1 = ref1.get();
+                    if( so1==null )
+                        continue liberation1;  // drop polled ref, 'cause it doesn't reference nothin anymore
+                    if( so1.released )
+                        continue liberation1;  // drop polled ref, 'cause it doesn't reference nothin anymore
+                    swap_q.add( ref1 );  // remember for swapping below
+                    to_free += so1.size;
                 }
-            } finally {
-                queue.addAll( tmpq );  // re-add swapped out objects
+            } catch(Throwable t) {
+                synchronized(queue) {
+                    queue.addAll( swap_q );  // re-add selected objects
+                }
+                throw t;
             }
         }
-        //<editor-fold defaultstate="collapsed" desc="debug output on">
-        if(true&&DEBUG)
+        //<editor-fold defaultstate="collapsed" desc="debug output off">
+        if(false&&DEBUG)
                 System.out.println( toString()+" goin2 free "+to_free+" bytes of memory by swapping "+swap_q.size() );
         //</editor-fold>
         try {
             liberation2:
             while( ! swap_q.isEmpty() ) {
-                final WeakReference<? extends SwapObject> ref = swap_q.poll();
-                assert( ref != null );
-                final SwapObject<T> so = ref.get();
-                //<editor-fold defaultstate="collapsed" desc="debug output on">
-                if(true&&DEBUG)
-                        System.out.println( toString()+" got from swap_q: "+ref+" - "+so );
+                final WeakReference<? extends SwapObject> ref2 = swap_q.poll();
+                assert( ref2 != null );
+                final SwapObject<T> so2 = ref2.get();
+                //<editor-fold defaultstate="collapsed" desc="debug output off">
+                if(false&&DEBUG)
+                        System.out.println( toString()+" got from swap_q: "+ref2+" - "+so2 );
                 //</editor-fold>
-                if( so==null )
+                if( so2==null )
                     continue liberation2;  // silently drop ref, because nothing referenced anymore; FIXME: but still was referenced above!?
-                synchronized(so) {
-                    if( so.released )
+                assert( so2 != this );
+                synchronized(so2) {
+                    if( so2.released )
                         continue liberation2;  // drop polled ref, 'cause it doesn't reference nothin anymore
-                    tmpq.add( ref );  // remember to re-add later
-                    freed += so.swapOut();
+                    tmpq.add( ref2 );  // remember to re-add later
+                    freed += so2.swapOut();  // usedPhys decremented in swapOut()
                 }
             }
             if( freed < amount )
-                throw new OutOfMemoryError("cannot free "+amount+", only released "+freed);
+                throw new UnableToReleaseError("cannot free "+amount+", only released "+freed);
             //<editor-fold defaultstate="collapsed" desc="debug output on">
-            if(true&&DEBUG)
-                    System.out.println( toString()+" freed "+freed+" bytes of memory" );
+            if(false&&DEBUG)
+                    System.out.println( toString()+" freed "+freed+" bytes of memory in freePhysical" );
             //</editor-fold>
         } finally {
             synchronized(queue) {
@@ -200,8 +221,8 @@ public abstract class SwapObject<T> extends Pointer
                 swapOutPayload_basic( swapfile );
                 swapedOut = true;
                 usedPhys -= size;
-                //<editor-fold defaultstate="collapsed" desc="debug output on">
-                if(true&&DEBUG)
+                //<editor-fold defaultstate="collapsed" desc="debug output off">
+                if(false&&DEBUG)
                         System.out.println( toString()+" swapped out "+size+" bytes to "+swapfile.toString() );
                 //</editor-fold>
                 return size;
@@ -221,8 +242,11 @@ public abstract class SwapObject<T> extends Pointer
 
     protected abstract String getTmpExt_basic();
 
+    /** write payload to disc and release the native memory */
     protected abstract void swapOutPayload_basic( Path p ) throws IOException;
 
+    /** count to to things once in a while, not every time */
+    private static int swapInCounter=0;
     private void swapIn() {
         assert( ! released );
         try {
@@ -230,22 +254,31 @@ public abstract class SwapObject<T> extends Pointer
                 try {
                     swapInPayload_basic( swapfile );
                     swapedOut = false;
-                    usedPhys += size;
-                    //<editor-fold defaultstate="collapsed" desc="debug output on">
-                    if(true&&DEBUG)
+//                    usedPhys += size;  already done in occupyMemWithFree, don't double here !!!!
+                    //<editor-fold defaultstate="collapsed" desc="debug output off">
+                    if(false&&DEBUG)
                             System.out.println( toString()+" swapped in from "+swapfile.toString() );
                     //</editor-fold>
                 } catch( IOException e ) {
                     throw new RuntimeException(e);
                 }
                 return size;
-            } );
+            } ); // end occupy
         } catch( Exception e) {
             System.err.println("cannot swap in: "+e);
             e.printStackTrace(System.err);
         }
+        if( (maxPhys<maxMaxPhys) && ( (swapInCounter++)%10 == 8 ) ) {
+            maxPhys += maxPhysStep;
+            //<editor-fold defaultstate="collapsed" desc="debug output on">
+            if(true&&DEBUG)
+                System.out.printf( "%s increasing maxPhys by one step\n  -  used %11d of %11d (%3d%%)\n          %11d of %11d\n",
+                                   toString(),Pointer.physicalBytes(),Pointer.maxPhysicalBytes(),(Pointer.physicalBytes()*100/Pointer.maxPhysicalBytes()),SwapMat.getUsedMem(),maxPhys );
+            //</editor-fold>
+        }
     }
 
+    /** read payload from disc and store */
     protected abstract void swapInPayload_basic( Path p ) throws IOException;
 
     /** when writing to the returned T-object, beware of race conditions if this object
@@ -256,36 +289,35 @@ public abstract class SwapObject<T> extends Pointer
                 throw new IllegalStateException("payload already released");
             if( this.swapedOut ) {
                 swapIn();
-//                swapedOut = false;
                 // keep swap file (?)
             }
             return getPayload_basic();
         }
     }
 
+    /** just return payload */
     protected abstract T getPayload_basic();
 
     public boolean releasePayload() {
         try {
-            boolean basic_ret=true, del_ret=true;
+            boolean del_ret=true;
             synchronized(this) {
-                if( ! swapedOut )
-                    basic_ret = releasePayload_basic();
-                if( basic_ret ) {
-                    released = true;
+                if( ! swapedOut ) {
+                    releasePayload_basic();
                     usedPhys -= size;
-                    if( swapfile != null ) {
-                        del_ret = swapfile.toFile().delete();
-                        if( del_ret )
-                            swapfile = null;
-                    }
+                }
+                released = true;
+                if( swapfile != null ) {
+                    del_ret = swapfile.toFile().delete();
+                    if( del_ret )
+                        swapfile = null;
                 }
             }
-            //<editor-fold defaultstate="collapsed" desc="debug output on">
-            if(true&&DEBUG)
-                    System.out.println( toString()+(basic_ret?"":" not")+" released "+size+" bytes of memory, "+(del_ret?"":"not ")+"deleted "+swapfile );
+            //<editor-fold defaultstate="collapsed" desc="debug output off">
+            if(false&&DEBUG)
+                    System.out.println( toString()+" released "+size+" bytes of memory, "+(del_ret?"":"not ")+"deleted "+swapfile );
             //</editor-fold>
-            return basic_ret && del_ret;
+            return del_ret;  // FIXME: needed anywhere??
         } catch(Throwable t) {
             System.out.println( "cannot release payload: "+t );
         } finally {
@@ -293,8 +325,8 @@ public abstract class SwapObject<T> extends Pointer
         }
     }
 
-    /** @return true if payload was release ok or release not necessary */
-    protected abstract boolean releasePayload_basic();
+    /** release the native memory */
+    protected abstract void releasePayload_basic();
 
     public static SwapObject releasePayloadNN( SwapObject so ) {
         if( so != null )
@@ -302,22 +334,30 @@ public abstract class SwapObject<T> extends Pointer
         return null;
     }
 
+    @Override
+    protected void finalize()
+            throws Throwable {
+        releasePayload();
+        super.finalize();
+    }
+
+    
     protected interface ParamVariant
     {
-        int getVariant();
+        long getRequired();
     };
-
-    protected class DecDeallocator implements Pointer.Deallocator {
-        @Override
-        public void deallocate() {
-            usedPhys -= size;
-        }
-    }
 
     public static long getUsedMem() { return usedPhys; }
 
+    public static long getMaxMem() { return maxPhys; }
+
     public String toString( String subclass_spec ) {
-        return "[ "+subclass_spec+", "+size+" "+(swapedOut?"S":"s")+(locked?"L":"l")+(released?"R":"r")+" "+(swapfile==null?"null":swapfile.toString())+"]";
+        //<editor-fold defaultstate="collapsed" desc="debug id">
+        if(IDDEBUG)
+            return "[#"+debugid+" "+subclass_spec+", "+size+" "+(swapedOut?"S":"s")+(locked?"L":"l")+(released?"R":"r")+" "+(swapfile==null?"null":swapfile.toString())+"]";
+        else
+        //</editor-fold>
+            return "[ "+subclass_spec+", "+size+" "+(swapedOut?"S":"s")+(locked?"L":"l")+(released?"R":"r")+" "+(swapfile==null?"null":swapfile.toString())+"]";
     }
 
     /** ONLY FOR ACCESS BY TEST CLASSES! */
